@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import mimetypes
 import os
 import queue
 import re
@@ -12,7 +13,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import soundfile as sf
 
@@ -24,6 +25,8 @@ from .transport import BEATS_PER_BAR, LOOP_BARS, NUM_TRACKS, Looper, Scheduler, 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 SOUNDS = os.path.join(ROOT, "sounds")
+VIDEOS = os.path.join(ROOT, "videos")
+VIDEO_EXTS = (".mp4", ".webm", ".ogv", ".m4v", ".mov")
 CONFIG = os.path.join(ROOT, "config.json")
 NUM_PAGES = 8
 PAGE_TYPES = ("soundboard", "piano", "drums", "sequencer", "looper")
@@ -60,6 +63,7 @@ BLACK_KEYS = {1, 3, 6, 8, 10}
 DEFAULT_BUTTON = {
     "action": "sound",      # sound | stop_all | stop_page
     "sound": "",
+    "video": "",            # optional file in videos/, shown (muted) on the /projector page
     "label": "",
     "mode": "oneshot",      # oneshot (retrigger) | hold (plays while held) | toggle
     "loop": False,
@@ -122,6 +126,11 @@ def migrate(cfg: dict) -> bool:
 class Soundboard:
     def __init__(self):
         os.makedirs(SOUNDS, exist_ok=True)
+        os.makedirs(VIDEOS, exist_ok=True)
+        self.pj_cond = threading.Condition()
+        self.pj_seq = 0
+        self.pj_events = []
+        self.pj_toggled = set()
         self.cfg = self._load_config()
         self.lock = threading.RLock()
         self.cond = threading.Condition()
@@ -529,6 +538,18 @@ class Soundboard:
     def _on_hw_button(self, ev) -> None:
         self.handle(ev.button.id, ev.pressed)
 
+    def videos(self):
+        return sorted(f for f in os.listdir(VIDEOS) if os.path.splitext(f)[1].lower() in VIDEO_EXTS) \
+            if os.path.isdir(VIDEOS) else []
+
+    def projector(self, cmd: str, **kw) -> None:
+        """Queue a command for the /projector page(s): play | stop | stop_all."""
+        with self.pj_cond:
+            self.pj_seq += 1
+            self.pj_events.append(dict(kw, cmd=cmd, seq=self.pj_seq))
+            del self.pj_events[:-50]
+            self.pj_cond.notify_all()
+
     def handle(self, bid: str, pressed: bool, from_gui: bool = False) -> None:
         with self.lock:
             if from_gui:
@@ -538,6 +559,7 @@ class Soundboard:
             elif bid in self.active:
                 # Release whatever this button started, even if the page changed meanwhile.
                 key, release = self.active.pop(bid)
+                self.projector("stop", key=key)
                 self.held_notes.pop(bid, None)
                 self._stop(key, release)
             if bid.startswith("top"):
@@ -558,20 +580,33 @@ class Soundboard:
             b = self.button_cfg(page, bid)
             key = f"{page}:{bid}"
             if b:
+                video = b.get("video") or ""
                 if b["action"] == "stop_all" and pressed:
                     self.audio.stop_all()
+                    self.pj_toggled.clear()
+                    self.projector("stop_all")
                 elif b["action"] == "stop_page" and pressed:
                     for k in self.audio.playing():
                         if k.startswith(f"{page}:"):
                             self._stop(k)
-                elif b["action"] == "sound" and b["sound"]:
-                    path = os.path.join(SOUNDS, b["sound"])
+                    self.pj_toggled = {k for k in self.pj_toggled if not k.startswith(f"{page}:")}
+                    self.projector("stop_page", prefix=f"{page}:")
+                elif b["action"] == "sound" and (b["sound"] or video):
+                    path = os.path.join(SOUNDS, b["sound"]) if b["sound"] else ""
                     try:
                         if pressed:
-                            if b["mode"] == "toggle" and key in self.audio.playing():
-                                self._stop(key)
+                            if b["mode"] == "toggle" and (key in self.audio.playing() or (not b["sound"] and key in self.pj_toggled)):
+                                self.pj_toggled.discard(key)
+                                if b["sound"]:
+                                    self._stop(key)
+                                self.projector("stop", key=key)
                             else:
-                                self._play(key, self.sample(path, b["fx"]), b["volume"], b["loop"])
+                                if video:
+                                    if b["mode"] == "toggle":
+                                        self.pj_toggled.add(key)
+                                    self.projector("play", key=key, video=video, loop=bool(b["loop"]))
+                                if b["sound"]:
+                                    self._play(key, self.sample(path, b["fx"]), b["volume"], b["loop"])
                                 if b["mode"] == "hold":
                                     self.active[bid] = (key, 0.0)
                     except Exception as e:
@@ -830,7 +865,7 @@ class Soundboard:
 
     def full_state(self) -> dict:
         with self.lock:
-            return {"config": copy.deepcopy(self.cfg), "sounds": self.sounds(),
+            return {"config": copy.deepcopy(self.cfg), "sounds": self.sounds(), "videos": self.videos(),
                     "defaults": DEFAULT_BUTTON, "fx_defaults": fx.DEFAULT_FX, "fx_limits": fx.LIMITS,
                     "synth": {"patches": synth.PATCHES, "kits": synth.KITS,
                               "scales": list(synth.SCALES), "notes": synth.NOTE_NAMES,
@@ -882,6 +917,18 @@ def make_handler(sb: Soundboard):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/projector":
+                with open(os.path.join(STATIC, "projector.html"), "rb") as f:
+                    body = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == "/api/projector":
+                self._projector_events()
+            elif path.startswith("/videos/"):
+                self._video_file(unquote(path[len("/videos/"):]))
             elif path == "/api/state":
                 self._json(sb.full_state())
             elif path == "/api/events":
@@ -890,6 +937,71 @@ def make_handler(sb: Soundboard):
                 self._audio_stream()
             else:
                 self._json({"error": "not found"}, 404)
+
+        def _projector_events(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            seen = sb.pj_seq          # only events from now on
+            try:
+                while True:
+                    with sb.pj_cond:
+                        if sb.pj_seq == seen:
+                            sb.pj_cond.wait(timeout=15)
+                        new = [e for e in sb.pj_events if e["seq"] > seen]
+                        seen = sb.pj_seq
+                    if new:
+                        for e in new:
+                            self.wfile.write(f"data: {json.dumps(e)}\n\n".encode())
+                    else:
+                        self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def _video_file(self, name):
+            path = os.path.join(VIDEOS, os.path.basename(name))
+            if os.path.splitext(path)[1].lower() not in VIDEO_EXTS or not os.path.isfile(path):
+                return self._json({"error": "not found"}, 404)
+            size = os.path.getsize(path)
+            start, end, code = 0, size - 1, 200
+            m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range") or "")
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                    end = int(m.group(2)) if m.group(2) else size - 1
+                else:
+                    start = max(0, size - int(m.group(2)))
+                end = min(end, size - 1)
+                if start > end:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                code = 206
+            ctype = mimetypes.guess_type(path)[0] or "video/mp4"
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(end - start + 1))
+            if code == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            try:
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    left = end - start + 1
+                    while left > 0:
+                        chunk = f.read(min(256 * 1024, left))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        left -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self.close_connection = True
 
         def _events(self):
             self.send_response(200)
@@ -958,6 +1070,15 @@ def make_handler(sb: Soundboard):
                     sb.audio.invalidate(dest)
                     sb.fxcache.drop(lambda k: k[0] == dest)
                     return self._json({"ok": True, "name": name, "sounds": sb.sounds()})
+                if path == "/api/upload_video":
+                    name = SAFE_NAME.sub("_", os.path.basename(self.headers.get("X-Filename", "")))
+                    if os.path.splitext(name)[1].lower() not in VIDEO_EXTS:
+                        return self._json({"error": "unsupported video type (use mp4 or webm)"}, 400)
+                    if int(self.headers.get("Content-Length") or 0) > 2 * 1024 ** 3:
+                        return self._json({"error": "file too large"}, 400)
+                    with open(os.path.join(VIDEOS, name), "wb") as f:
+                        f.write(self._body())
+                    return self._json({"ok": True, "name": name, "videos": sb.videos()})
                 data = json.loads(self._body() or b"{}")
                 if path == "/api/press":
                     sb.handle(data["id"], bool(data["down"]), from_gui=True)
@@ -1023,6 +1144,7 @@ def make_handler(sb: Soundboard):
                     sb.audio.play_data("__preview__", sb.sample(p, data.get("fx")), float(data.get("volume", 1.0)))
                 elif path == "/api/stop_all":
                     sb.audio.stop_all()
+                    sb.projector("stop_all")
                 elif path == "/api/test_leds":
                     sb.lp.test_leds(int(data.get("level", 3)), 1.2)
                 elif path == "/api/animate":

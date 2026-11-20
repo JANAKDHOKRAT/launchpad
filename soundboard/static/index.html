@@ -494,6 +494,7 @@ function renderEditor() {
   const exists = !!btnCfg(selected);
   const b = btnCfg(selected) || {...S.defaults};
   const where = selected.startsWith("side") ? `Side button ${+selected.slice(4) + 1}` : `Pad column ${+selected[3] + 1}, row ${+selected[4] + 1}`;
+  const vopts = ['<option value="">— none —</option>'].concat((S.videos || []).map(v => `<option ${v === b.video ? "selected" : ""}>${esc(v)}</option>`)).join("");
   const opts = ['<option value="">— none —</option>'].concat(S.sounds.map(s => `<option ${s === b.sound ? "selected" : ""}>${esc(s)}</option>`)).join("");
   ed.innerHTML = `
     <h2>${where}</h2><div class="sub">${S.config.pages[page()].name} · changes save automatically</div>
@@ -506,7 +507,11 @@ function renderEditor() {
       <div class="field"><label for="fSound">Sound</label>
         <div class="row"><select id="fSound">${opts}</select>
           <button id="preview" title="Preview through the speakers">▶ Preview</button>
-          <button id="uploadBtn">Upload…</button><input type="file" id="file" accept="audio/*" multiple hidden></div></div>
+          <button id="uploadBtn">Upload…</button><input type="file" id="file" accept="audio/*,video/*,.mp4,.webm,.mov,.m4v,.ogv" multiple hidden></div></div>
+      <div class="field"><label for="fVideo">Projector video <small>(muted, plays with the sound)</small></label>
+        <div class="row"><select id="fVideo">${vopts}</select>
+          <button id="uploadVideoBtn">Upload video…</button><input type="file" id="vfile" accept="video/*" hidden>
+          <a href="/projector" target="_blank" style="color:inherit">Open projector ↗</a></div></div>
       <div class="field"><label for="fMode">Playback</label>
         <div class="row"><select id="fMode">
           <option value="oneshot">One-shot (press again restarts)</option>
@@ -533,6 +538,14 @@ function renderEditor() {
   $("#fAction").onchange = e => { set({action: e.target.value}).then(renderEditor); };
   $("#fSound").onchange = e => { const s = e.target.value; const c = cur(); set({sound: s, label: c.label || s.replace(/\.[^.]+$/, "")}).then(renderEditor); };
   $("#fMode").onchange = e => set({mode: e.target.value});
+  $("#fVideo").onchange = e => set({video: e.target.value});
+  $("#uploadVideoBtn").onclick = () => $("#vfile").click();
+  $("#vfile").onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    const res = await fetch("/api/upload_video", {method: "POST", headers: {"X-Filename": f.name}, body: f}).then(r => r.json());
+    if (res.error) return alert(`${f.name}: ${res.error}`);
+    S.videos = res.videos; await set({video: res.name}); renderEditor();
+  };
   $("#fLoop").onchange = e => set({loop: e.target.checked});
   $("#fVol").oninput = e => $("#volTxt").textContent = Math.round(e.target.value * 100) + "%";
   $("#fVol").onchange = e => set({volume: +e.target.value});
@@ -540,9 +553,17 @@ function renderEditor() {
   $("#preview").onclick = () => { const s = $("#fSound").value; if (s) api("/api/preview", {sound: s, volume: +$("#fVol").value, fx: cur().fx}); };
   $("#uploadBtn").onclick = () => $("#file").click();
   $("#file").onchange = async e => {
-    let last = null;
-    for (const f of e.target.files) last = (await upload(f)) || last;
-    if (last) { const c = cur(); await set({sound: last.name, label: c.label || last.name.replace(/\.[^.]+$/, "")}); renderEditor(); }
+    let last = null, vid = null;
+    for (const f of e.target.files) {
+      if (/\.(mp4|webm|mov|m4v|ogv)$/i.test(f.name) || f.type.startsWith("video/")) {
+        const res = await fetch("/api/upload_video", {method: "POST", headers: {"X-Filename": f.name}, body: f}).then(r => r.json());
+        if (res.error) alert(`${f.name}: ${res.error}`); else { S.videos = res.videos; vid = res; }
+      } else last = (await upload(f)) || last;
+    }
+    const c = cur(), patch = {};
+    if (last) { patch.sound = last.name; patch.label = c.label || last.name.replace(/\.[^.]+$/, ""); }
+    if (vid) { patch.video = vid.name; if (!patch.label && !c.label) patch.label = vid.name.replace(/\.[^.]+$/, ""); }
+    if (last || vid) { await set(patch); renderEditor(); }
   };
   ed.querySelectorAll(".sw").forEach(sw => sw.onclick = () => {
     set({[sw.dataset.key]: sw.dataset.c.split(",").map(Number)}).then(renderEditor);
