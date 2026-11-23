@@ -11,6 +11,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from . import fx as _fx
+from . import sampler as _sampler
 
 # ------------------------------------------------------------------ catalogues
 PATCHES: Dict[str, str] = {        # id -> display name (first 6 = default side-button slots)
@@ -161,8 +162,22 @@ def _finish(y: np.ndarray, sr: int, peak: float = 0.45) -> np.ndarray:
 
 
 # ------------------------------------------------------------------ instruments
+def register_sampled(instruments) -> None:
+    """Add the sample-based instruments (sampler.Instrument) to the patch catalogues."""
+    for k in [k for k in PATCHES if _sampler.is_sampled(k)]:
+        del PATCHES[k]
+        PATCH_SHORT.pop(k, None)
+        RELEASE.pop(k, None)
+    for inst in instruments.values():
+        PATCHES[inst.id] = inst.name
+        PATCH_SHORT[inst.id] = inst.short
+        RELEASE[inst.id] = inst.release
+
+
 def render_note(patch: str, midi: float, sr: int, fx=None) -> np.ndarray:
     """A note with optional effects; fx["pitch"]/["fine"] transpose instead of resampling."""
+    if _sampler.is_sampled(patch):
+        return _sampler.render_note(patch, midi, sr, fx)
     if not fx or _fx.is_neutral(fx):
         return _render_note(patch, midi, sr)
     fx = _fx.clean(fx)

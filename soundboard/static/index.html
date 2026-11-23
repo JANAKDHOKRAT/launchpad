@@ -356,7 +356,8 @@ function renderInstrumentEditor() {
       `<option value="${v}" ${inst.slots[i] === v ? "selected" : ""}>${esc(n)}</option>`).join("") + "</select></label>";
     ed.innerHTML = `
       <h2>Piano / synth</h2><div class="sub">${esc(S.config.pages[p].name)} · play on the grid · side buttons: 1–2 octave up/down, 3–8 sound slots</div>
-      <div class="field"><label>Sound (${Object.keys(sy.patches).length} instruments)</label>${seg("patch", sy.patches, inst.patch)}</div>
+      <div class="field"><label>Sound (${Object.keys(sy.patches).length} instruments)</label>${seg("patch", sy.patches, inst.patch)}
+        ${sampleInfo(inst.patch)}</div>
       <div class="field"><label>Sounds on side buttons 3–8</label><div class="slots">${[0,1,2,3,4,5].map(slotSel).join("")}</div></div>
       <div class="field"><label for="iLayout">Grid layout</label>
         <select id="iLayout" style="width:100%">
@@ -373,7 +374,15 @@ function renderInstrumentEditor() {
         <div><label>${inst.layout === "piano" ? "White keys" : "Notes"}</label>${swatches("key", col.key)}</div>
         <div><label>Black keys</label>${swatches("black", col.black)}</div>
         <div><label>Root note</label>${swatches("root", col.root)}</div>
-        <div><label>Pressed</label>${swatches("pressed", col.pressed)}</div></div></div>`;
+        <div><label>Pressed</label>${swatches("pressed", col.pressed)}</div></div></div>
+      ${animPanel(inst.anim)}`;
+    bindAnimPanel(inst.anim, send);
+    $("#rescan").onclick = async () => {
+      $("#rescan").disabled = true;
+      const st = await api("/api/rescan_instruments");
+      if (st && st.synth) { S = st; snap = st.state; }
+      renderEditor(); render();
+    };
     $("#iLayout").value = inst.layout; $("#iRoot").value = inst.root; $("#iScale").value = inst.scale;
     $("#iLayout").onchange = e => send({layout: e.target.value});
     $("#iRoot").onchange = e => send({root: +e.target.value});
@@ -416,8 +425,56 @@ function renderInstrumentEditor() {
     send({[b.parentElement.id === "seg-patch" ? "patch" : "kit"]: b.dataset.v}));
   $("#iVol").oninput = e => $("#iVolTxt").textContent = Math.round(e.target.value * 100) + "%";
   $("#iVol").onchange = e => send({volume: +e.target.value});
-  ed.querySelectorAll(".sw").forEach(sw => sw.onclick = () =>
-    send({colors: {[sw.dataset.key]: sw.dataset.c.split(",").map(Number)}}));
+  ed.querySelectorAll(".sw").forEach(sw => sw.onclick = () => {
+    const c = sw.dataset.c.split(",").map(Number);
+    send(sw.dataset.key === "anim" ? {anim: {color: c}} : {colors: {[sw.dataset.key]: c}});
+  });
+}
+
+// Sample-based instruments from the instruments/ folder: credit line, load errors, rescan.
+function sampleInfo(patch) {
+  const I = S.instruments || {}, errs = Object.entries(S.instrument_errors || {});
+  const cur = I[patch];
+  let h = `<div class="row hint" style="margin-top:8px">`;
+  h += cur ? `<span>Samples: <b>${esc(cur.name)}</b> · ${cur.samples} sample${cur.samples === 1 ? "" : "s"} · ${esc(cur.source)}${cur.credit ? ` · ${esc(cur.credit)}` : ""}</span>`
+           : `<span>${Object.keys(I).length} sampled instrument${Object.keys(I).length === 1 ? "" : "s"} loaded from <code>instruments/</code></span>`;
+  h += `<span class="spacer"></span><button type="button" id="rescan" title="Look for new sample libraries in instruments/">Rescan instruments</button></div>`;
+  if (errs.length) h += `<div class="hint" style="color:var(--bad)">Instrument problems: ${errs.map(([k, v]) => esc(k + " (" + v + ")")).join(", ")}</div>`;
+  return h;
+}
+
+// Key-press LED animation (piano). Shape + motion + radius + duration + colour; "off" by default.
+function animPanel(a) {
+  const A = S.anim, off = a.style === "off";
+  const [rLo, rHi] = A.limits.radius, [dLo, dHi] = A.limits.duration;
+  const opts = (items, cur) => Object.entries(items).map(([v, n]) =>
+    `<option value="${v}" ${v === cur ? "selected" : ""}>${esc(n)}</option>`).join("");
+  return `<details class="fx" id="animBox" ${animOpen ? "open" : ""}><summary><b>Key-press animation</b> · ${off ? "off" : esc(A.styles[a.style] + ", " + A.motions[a.motion].toLowerCase())}${a.hide_keys ? " · keys dark" : ""}</summary>
+    <div class="hint" style="margin-top:6px">Pressing a key lights up the pads around it.</div>
+    <div class="fxgrid">
+      <label for="aStyle">Shape</label><select id="aStyle" style="grid-column: span 2">${opts(A.styles, a.style)}</select>
+      <label for="aMotion">Motion</label><select id="aMotion" style="grid-column: span 2" ${off ? "disabled" : ""}>${opts(A.motions, a.motion)}</select>
+      <label for="aRadius">Radius</label><input type="range" id="aRadius" min="${rLo}" max="${rHi}" step="1" value="${a.radius}" ${off ? "disabled" : ""}>
+      <output id="aRadiusO">${a.radius} pads</output>
+      <label for="aDur">Duration</label><input type="range" id="aDur" min="${dLo}" max="${dHi}" step="0.05" value="${a.duration}" ${off ? "disabled" : ""}>
+      <output id="aDurO">${Math.round(a.duration * 1000)} ms</output>
+    </div>
+    <div class="field" style="margin:10px 0 0"><label>Colour</label>${swatches("anim", a.color)}</div>
+    <label class="check" style="margin-top:10px"><input type="checkbox" id="aHide" ${a.hide_keys ? "checked" : ""}>
+      Animations only: keep idle keys dark (pressed keys and animations still light up)</label></details>`;
+}
+let animOpen = false;
+function bindAnimPanel(a, send) {
+  const box = $("#animBox"); if (!box) return;
+  box.addEventListener("toggle", () => animOpen = box.open);
+  const patch = p => send({anim: p});
+  $("#aStyle").onchange = e => patch({style: e.target.value});
+  $("#aMotion").onchange = e => patch({motion: e.target.value});
+  $("#aRadius").oninput = e => $("#aRadiusO").textContent = e.target.value + " pads";
+  $("#aRadius").onchange = e => patch({radius: +e.target.value});
+  $("#aDur").oninput = e => $("#aDurO").textContent = Math.round(e.target.value * 1000) + " ms";
+  $("#aDur").onchange = e => patch({duration: +e.target.value});
+  $("#aHide").onchange = e => patch({hide_keys: e.target.checked});
 }
 
 const TRACK_STATE = {empty: "empty", armed: "waiting for the next bar…", recording: "recording", playing: "playing", muted: "muted"};

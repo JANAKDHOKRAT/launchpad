@@ -17,13 +17,14 @@ from urllib.parse import urlparse
 import soundfile as sf
 
 from lpdriver import BRIGHTNESS_LEVELS, Button, Color, Launchpad, OFF, all_buttons
-from . import fx, synth
+from . import anim, fx, sampler, synth
 from .audio import AUDIO_EXTS, AudioEngine
 from .transport import BEATS_PER_BAR, LOOP_BARS, NUM_TRACKS, Looper, Scheduler, Transport
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 SOUNDS = os.path.join(ROOT, "sounds")
+INSTRUMENTS = os.path.join(ROOT, "instruments")  # your own sample libraries, see sampler.py
 CONFIG = os.path.join(ROOT, "config.json")
 NUM_PAGES = 8
 PAGE_TYPES = ("soundboard", "piano", "drums", "sequencer", "looper")
@@ -45,6 +46,7 @@ DEFAULT_INST = {
     "swing": 0.0,           # sequencer swing 0 .. 0.5 (fraction of a 16th the off-beats are late)
     "fx": {},               # see fx.DEFAULT_FX
     "colors": {"key": [0, 1], "black": [1, 0], "root": [0, 3], "pressed": [3, 3]},
+    "anim": anim.DEFAULT_ANIM,  # key-press LED animation (piano), off by default; see anim.py
 }
 # Step sequencer ("seq" key of a sequencer page). Rows top -> bottom.
 DEFAULT_SEQ = {
@@ -122,6 +124,7 @@ def migrate(cfg: dict) -> bool:
 class Soundboard:
     def __init__(self):
         os.makedirs(SOUNDS, exist_ok=True)
+        synth.register_sampled(sampler.scan(INSTRUMENTS))
         self.cfg = self._load_config()
         self.lock = threading.RLock()
         self.cond = threading.Condition()
@@ -152,6 +155,8 @@ class Soundboard:
         self.scheduler = Scheduler(self.transport, self.looper, self._seq_step, self._tick_refresh)
         self._seq_pages: tuple = ()
         self._update_seq_cache()
+        self.bursts: list = []                          # running key-press animations (anim.Burst)
+        self._anim_wake = threading.Event()
 
     # ------------------------------------------------------------- config
     def _load_config(self) -> dict:
@@ -222,6 +227,9 @@ class Soundboard:
         inst = dict(DEFAULT_INST, **raw)
         inst["colors"] = dict(DEFAULT_INST["colors"], **raw.get("colors", {}))
         inst["fx"] = fx.clean(raw.get("fx", {}))
+        inst["anim"] = anim.clean(raw.get("anim", {}))
+        if inst["patch"] not in synth.PATCHES:  # e.g. a sample library that was removed
+            inst["patch"] = DEFAULT_INST["patch"]
         slots = [s for s in inst["slots"] if s in synth.PATCHES][:6]
         inst["slots"] = slots + [s for s in DEFAULT_INST["slots"] if s not in slots][: 6 - len(slots)]
         return inst
@@ -326,6 +334,9 @@ class Soundboard:
                 elif k == "fx" and isinstance(v, dict):
                     merged = dict(inst.get("fx", {}), **v)
                     inst["fx"] = {a: b for a, b in fx.clean(merged).items() if b != fx.DEFAULT_FX[a]}
+                elif k == "anim" and isinstance(v, dict):
+                    merged = anim.clean(dict(inst.get("anim", {}), **v))
+                    inst["anim"] = {a: b for a, b in merged.items() if b != anim.DEFAULT_ANIM[a]}
                 elif k in valid and valid[k](v):
                     inst[k] = v
             inst["octave"] = max(0, min(5, int(self.inst_cfg(page)["octave"])))
@@ -392,6 +403,9 @@ class Soundboard:
             self._play(key, synth.render_note(inst["patch"], act[1], sr, inst["fx"]), inst["volume"])
             self.active[bid] = (key, synth.RELEASE[inst["patch"]])
             self.held_notes[bid] = act[1]
+            if inst["anim"]["style"] != "off":
+                self.bursts.append(anim.Burst(page, int(bid[3]), int(bid[4]), inst["anim"]))
+                self._anim_wake.set()
         elif kind == "drum":
             if act[1] == synth.CLOSED_HAT:  # closed hat chokes the open hat, like real hi-hats
                 self._stop(f"{page}:drum{synth.OPEN_HAT}", 0.02)
@@ -495,6 +509,7 @@ class Soundboard:
         self.lp.start()
         threading.Thread(target=self._poll_loop, daemon=True).start()
         threading.Thread(target=self._warm_loop, daemon=True).start()
+        threading.Thread(target=self._anim_loop, daemon=True).start()
         for i in range(NUM_PAGES):
             if self.page_type(i) in INSTRUMENT_TYPES:
                 self.prewarm(i)
@@ -585,6 +600,7 @@ class Soundboard:
         held = {b.id for b in self.lp.held} | self.gui_held
         ptype = self.page_type(page)
         imap = self.instrument_map(page) if ptype != "soundboard" else None
+        overlay = anim.frame(self.bursts, page, time.monotonic()) if ptype == "piano" and self.bursts else {}
         recording = any(t.state in ("armed", "recording") or t.overdub for t in self.looper.tracks)
         looping = any(t.state == "playing" for t in self.looper.tracks) and self.transport.playing
         out: Dict[Button, Tuple[Color, bool]] = {}
@@ -622,6 +638,10 @@ class Soundboard:
                     out[btn] = self._looper_led(imap, bid, held)
                 else:
                     out[btn] = self._instrument_led(page, imap, bid, held)
+                    lit = overlay.get((btn.x, btn.y)) if btn.kind == "pad" else None
+                    if lit and bid not in held and not (imap.get(bid, (None,))[0] == "note"
+                                                        and imap[bid][1] in self.held_notes.values()):
+                        out[btn] = (Color(*lit), False)
                 continue
             b = self.button_cfg(page, bid)
             if bid in held:
@@ -646,6 +666,8 @@ class Soundboard:
         if kind == "note":
             if down or act[1] in self.held_notes.values():  # also light duplicates of the note
                 return Color(*col["pressed"]), False
+            if inst["anim"]["hide_keys"]:  # "animations only": idle keys stay dark
+                return OFF, False
             if act[1] % 12 == inst["root"]:
                 return Color(*col["root"]), False
             return Color(*(col["black"] if act[2] else col["key"])), False
@@ -789,6 +811,18 @@ class Soundboard:
             self.lp.set_leds(desired)
         self.bump()
 
+    def _anim_loop(self) -> None:
+        """Redraw the LEDs at ~30 fps while key-press animations are running."""
+        while True:
+            self._anim_wake.wait()
+            time.sleep(1 / 30)
+            with self.lock:
+                now = time.monotonic()
+                self.bursts = [b for b in self.bursts if not b.done(now)]
+                if not self.bursts:
+                    self._anim_wake.clear()
+            self._tick_refresh()  # also draws the frame after the last burst ends (restores LEDs)
+
     def _poll_loop(self) -> None:
         """Notice sounds that finished on their own so their LEDs go back to idle."""
         while True:
@@ -832,6 +866,11 @@ class Soundboard:
         with self.lock:
             return {"config": copy.deepcopy(self.cfg), "sounds": self.sounds(),
                     "defaults": DEFAULT_BUTTON, "fx_defaults": fx.DEFAULT_FX, "fx_limits": fx.LIMITS,
+                    "anim": {"styles": anim.STYLES, "motions": anim.MOTIONS, "limits": anim.LIMITS},
+                    "instruments": {k: {"name": i.name, "credit": i.credit, "samples": len(i.regions),
+                                        "source": os.path.relpath(i.source, ROOT)}
+                                    for k, i in sampler.INSTRUMENTS.items()},
+                    "instrument_errors": dict(sampler.ERRORS),
                     "synth": {"patches": synth.PATCHES, "kits": synth.KITS,
                               "scales": list(synth.SCALES), "notes": synth.NOTE_NAMES,
                               "drums": [d[0] for d in synth.DRUMS]},
@@ -1025,6 +1064,14 @@ def make_handler(sb: Soundboard):
                     sb.audio.stop_all()
                 elif path == "/api/test_leds":
                     sb.lp.test_leds(int(data.get("level", 3)), 1.2)
+                elif path == "/api/rescan_instruments":
+                    with sb.lock:
+                        synth.register_sampled(sampler.scan(INSTRUMENTS))
+                    for i in range(NUM_PAGES):
+                        if sb.page_type(i) == "piano":
+                            sb.prewarm(i)
+                    sb.refresh()
+                    return self._json(sb.full_state())
                 elif path == "/api/animate":
                     threading.Thread(target=sb._intro, daemon=True).start()
                 else:

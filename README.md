@@ -67,6 +67,14 @@ between the soundboard and the instruments. All instrument sounds are synthesize
   *Scale grid* (only notes in the chosen key/scale, each row a 4th higher; 10 scales).
   The root note is highlighted; pressing a note lights every pad that plays that note.
   Notes sustain while held and use per-sound release times.
+  Optional **key-press animations** (off by default; *Key-press animation* in the piano editor) light the
+  pads around a pressed key: shape *burst* (radius), *cross*, *diagonals*, *star*, *square*, *row*, *column*
+  or *sparkle*, with a *wave*, *ripple* or *flash* motion and adjustable radius, duration and colour.
+  *Animations only* keeps the idle keys dark so only pressed keys and the animations light up.
+* **Sampled instruments**: drop your own sample libraries (an SFZ, or audio files named by note such as
+  `C4.wav`) into `instruments/<name>/` and they appear next to the synth sounds. See
+  [`instruments/README.md`](instruments/README.md). That folder is gitignored: only commit samples whose
+  licence allows redistribution.
 * **Drum kit**: 16 big pads (2×2 buttons each) with kick, sub kick, snare, clap, closed/open hat
   (closed chokes open), shaker, ride, 3 toms, crash, rim, cowbell, conga and zap. Five synthesized kits
   (808, 909, electro, lo-fi, industrial) on side buttons 1–5; side 8 stops everything.
@@ -114,6 +122,8 @@ Contributions are welcome, especially support for more controllers. A short map 
 | `soundboard/app.py` | The app: config (`config.json`, migrated by `migrate()`), pages, the mapping from buttons to actions (`instrument_map`), LED rendering (`compute_leds`), and the HTTP API + SSE that the web GUI uses. |
 | `soundboard/audio.py` | Mixer (sounddevice callback) with a sample-accurate frame clock (`play_data(..., at=frame)`), plus PCM streaming to browsers. |
 | `soundboard/synth.py`, `fx.py` | Instruments, drum kits and effects, all rendered offline with numpy and cached. |
+| `soundboard/sampler.py` | Sampled instruments from `instruments/` (SFZ subset + note-named files), registered as `sample:<name>` synth patches. |
+| `soundboard/anim.py` | Key-press LED animations for the piano (shapes × motions), overlaid in `compute_leds`. |
 | `soundboard/transport.py` | Tempo/transport, lookahead scheduler, step sequencer timing and the looper. |
 | `soundboard/static/index.html` | The whole web GUI in one file (vanilla JS, no build step). |
 | `linux/` | udev rule, install script, systemd unit, desktop file. |
