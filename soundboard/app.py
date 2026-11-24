@@ -19,6 +19,7 @@ import soundfile as sf
 
 from lpdriver import BRIGHTNESS_LEVELS, Button, Color, Launchpad, OFF, all_buttons
 from . import fx, synth
+from .voice import EventBus, VoiceState
 from .audio import AUDIO_EXTS, AudioEngine
 from .transport import BEATS_PER_BAR, LOOP_BARS, NUM_TRACKS, Looper, Scheduler, Transport
 
@@ -26,10 +27,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 SOUNDS = os.path.join(ROOT, "sounds")
 VIDEOS = os.path.join(ROOT, "videos")
+VOICE_DIST = os.path.join(ROOT, "voice", "dist")   # CHIMERA web app built by voice/build.sh
 VIDEO_EXTS = (".mp4", ".webm", ".ogv", ".m4v", ".mov")
 CONFIG = os.path.join(ROOT, "config.json")
 NUM_PAGES = 8
-PAGE_TYPES = ("soundboard", "piano", "drums", "sequencer", "looper")
+PAGE_TYPES = ("soundboard", "piano", "drums", "sequencer", "looper", "voice")
 INSTRUMENT_TYPES = ("piano", "drums", "sequencer")
 # Where sound comes out: the machine running this program, the browser showing the GUI, or both.
 # macOS is usually run on the laptop the Launchpad is plugged into; Linux often on a headless box.
@@ -131,6 +133,8 @@ class Soundboard:
         self.pj_seq = 0
         self.pj_events = []
         self.pj_toggled = set()
+        self.voice_bus = EventBus()
+        self.voice = VoiceState(self.voice_bus)
         self.cfg = self._load_config()
         self.lock = threading.RLock()
         self.cond = threading.Condition()
@@ -267,6 +271,8 @@ class Soundboard:
         """
         t = self.page_type(page)
         m: Dict[str, tuple] = {}
+        if t == "voice":
+            return self.voice.layout()
         if t == "piano":
             inst = self.inst_cfg(page)
             base = 12 * (inst["octave"] + 1)
@@ -556,7 +562,9 @@ class Soundboard:
                 (self.gui_held.add if pressed else self.gui_held.discard)(bid)
             if pressed:
                 self.last_press = bid
-            elif bid in self.active:
+            else:
+                self.voice.up(bid)
+            if not pressed and bid in self.active:
                 # Release whatever this button started, even if the page changed meanwhile.
                 key, release = self.active.pop(bid)
                 self.projector("stop", key=key)
@@ -569,6 +577,10 @@ class Soundboard:
                 self.refresh()
                 return
             page = self.cfg["page"]
+            if self.page_type(page) == "voice":
+                self.voice.press(bid, pressed)
+                self.refresh()
+                return
             if self.page_type(page) != "soundboard":
                 if pressed:
                     try:
@@ -637,6 +649,8 @@ class Soundboard:
                     out[btn] = (Color(3, 3), False)
                 elif active or (pt == "looper" and looping):
                     out[btn] = (Color(0, 3), True)
+                elif pt == "voice":
+                    out[btn] = (Color(2, 2), False)   # yellow: CHIMERA voice page
                 elif pt == "piano":
                     out[btn] = (Color(2, 1), False)   # orange-ish: piano page
                 elif pt == "drums":
@@ -651,7 +665,10 @@ class Soundboard:
                     out[btn] = (OFF, False)
                 continue
             if imap is not None:
-                if ptype == "sequencer":
+                if ptype == "voice":
+                    (r, g), fl = self.voice.led(bid, bid in held)
+                    out[btn] = (Color(r, g), fl)
+                elif ptype == "sequencer":
                     out[btn] = self._seq_led(page, imap, bid, held)
                 elif ptype == "looper":
                     out[btn] = self._looper_led(imap, bid, held)
@@ -773,6 +790,8 @@ class Soundboard:
         """Pad captions for the GUI on instrument / looper pages."""
         out = {}
         t = self.page_type(page)
+        if t == "voice":
+            return self.voice.labels()
         seq = self.seq_cfg(page) if t == "sequencer" else None
         for bid, act in self.instrument_map(page).items():
             kind = act[0]
@@ -851,6 +870,7 @@ class Soundboard:
                     "leds": leds, "playing": playing, "last_press": self.last_press,
                     "held": sorted({b.id for b in self.lp.held}),
                     "page_type": ptype,
+                    "voice": self.voice.snapshot() if ptype == "voice" else None,
                     "page_types": [self.page_type(i) for i in range(NUM_PAGES)],
                     "inst": self.inst_cfg(page) if ptype in INSTRUMENT_TYPES else None,
                     "seq": dict(self.seq_cfg(page), view=self.seq_view.get(page, 0),
@@ -927,6 +947,17 @@ def make_handler(sb: Soundboard):
                 self.wfile.write(body)
             elif path == "/api/projector":
                 self._projector_events()
+            elif path == "/api/voice":
+                self._voice_events()
+            elif path == "/voice":
+                self.send_response(301)
+                self.send_header("Location", "/voice/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif path.startswith("/voice/"):
+                self._voice_file(unquote(path[len("/voice/"):]))
+            elif path.startswith(("/data/", "/fonts/")) and os.path.isdir(VOICE_DIST):
+                self._voice_file(unquote(path[1:]))     # CHIMERA fetches its dictionary / fonts from the site root
             elif path.startswith("/videos/"):
                 self._video_file(unquote(path[len("/videos/"):]))
             elif path == "/api/state":
@@ -960,6 +991,55 @@ def make_handler(sb: Soundboard):
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
+
+        def _voice_events(self):
+            bus = sb.voice_bus
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            seen = bus.seq          # only events from now on
+            try:
+                self.wfile.write(f"data: {json.dumps({'cmd': 'hello', 'state': sb.voice.snapshot()})}\n\n".encode())
+                self.wfile.flush()
+                while True:
+                    with bus.cond:
+                        if bus.seq == seen:
+                            bus.cond.wait(timeout=15)
+                        new = [e for e in bus.events if e["seq"] > seen]
+                        seen = bus.seq
+                    if new:
+                        for e in new:
+                            self.wfile.write(f"data: {json.dumps(e)}\n\n".encode())
+                    else:
+                        self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def _voice_file(self, rel):
+            """Static files of the CHIMERA web app (voice/dist), with Range support for the wasm."""
+            root = os.path.realpath(VOICE_DIST)
+            path = os.path.realpath(os.path.join(root, rel or "index.html"))
+            if os.path.isdir(path):
+                path = os.path.join(path, "index.html")
+            if not (path == root or path.startswith(root + os.sep)) or not os.path.isfile(path):
+                if not os.path.isdir(root):
+                    return self._json({"error": "CHIMERA is not built: run voice/build.sh"}, 404)
+                return self._json({"error": "not found"}, 404)
+            ctype = {".wasm": "application/wasm", ".js": "text/javascript", ".mjs": "text/javascript",
+                     ".css": "text/css", ".html": "text/html; charset=utf-8", ".json": "application/json",
+                     ".svg": "image/svg+xml", ".woff2": "font/woff2"}.get(
+                os.path.splitext(path)[1].lower()) or mimetypes.guess_type(path)[0] or "application/octet-stream"
+            with open(path, "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
 
         def _video_file(self, name):
             path = os.path.join(VIDEOS, os.path.basename(name))
