@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+config.json
+config.json.tmp
+sounds/*
+!sounds/.gitkeep
+videos/*
+!videos/.gitkeep
+voice/chimera-src/
+voice/dist/
